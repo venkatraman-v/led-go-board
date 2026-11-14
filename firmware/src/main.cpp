@@ -220,5 +220,13 @@ void setup() {
 }
 
 void loop() {
-  checkSerial();
+  int x = analogRead(A4);
+  int y = analogRead(A5);
+
+  Serial.print("X: ");
+  Serial.print(x);
+  Serial.print(" | Y: ");
+  Serial.println(y);
+
+  delay(200);
 }
