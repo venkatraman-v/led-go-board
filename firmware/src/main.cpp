@@ -5,6 +5,7 @@
 // ============================================================================
 // Hardware Pin Configuration for Arduino Uno / Elegoo R3
 // ============================================================================
+// RGB Matrix Panel Control Pins
 #define CLK 8
 #define OE  9
 #define LAT 10
@@ -14,6 +15,10 @@
 #define D   A3
 // Note: RGB data pins (R1, G1, B1, R2, G2, B2) are hardcoded 
 // to digital pins 2 through 7 in the library for the Uno.
+
+// Analog Joystick Pins
+#define JOY_X_PIN A4
+#define JOY_Y_PIN A5
 
 RGBmatrixPanel matrix(A, B, C, D, CLK, LAT, OE, false);
 
@@ -88,6 +93,15 @@ void drawTriangle(int16_t x0, int16_t y0, int16_t x1, int16_t y1, int16_t x2, in
 }
 
 // ============================================================================
+// JOYSTICK FUNCTION
+// ============================================================================
+// Reads and returns current raw analog values from the joystick (0 to 1023)
+void getJoystick(int &x, int &y) {
+  x = analogRead(JOY_X_PIN);
+  y = analogRead(JOY_Y_PIN);
+}
+
+// ============================================================================
 // SERIAL COMMAND TRANSLATOR / DISPATCHER
 // ============================================================================
 
@@ -114,8 +128,17 @@ void processCommand(char* buf) {
 
   char cmd = *p++; // First letter determines command
 
-  // 'P' x y r g b  -> Pixel
-  if (cmd == 'P' || cmd == 'p') {
+  // 'J'            -> Get Joystick readings (returns "J <x> <y>")
+  if (cmd == 'J' || cmd == 'j') {
+    int jx, jy;
+    getJoystick(jx, jy);
+    Serial.print(F("J "));
+    Serial.print(jx);
+    Serial.print(' ');
+    Serial.println(jy);
+  }
+  // 'P' x y r g b  -> Pixel (r, g, b from 0 to 7)
+  else if (cmd == 'P' || cmd == 'p') {
     int x = readInt(&p);
     int y = readInt(&p);
     int r = readInt(&p);
@@ -220,13 +243,5 @@ void setup() {
 }
 
 void loop() {
-  int x = analogRead(A4);
-  int y = analogRead(A5);
-
-  Serial.print("X: ");
-  Serial.print(x);
-  Serial.print(" | Y: ");
-  Serial.println(y);
-
-  delay(200);
+  checkSerial();
 }
