@@ -1,7 +1,10 @@
 import argparse
+import queue
 import re
 import shlex
 import sys
+import threading
+import time
 
 from analysis import KataGoError, KataGoPlayer
 from board import Board, Piece
@@ -110,11 +113,12 @@ def _engine_turn(game: Game, player: KataGoPlayer, led: LEDRenderer = None) -> b
 
 
 def _finish_turn(game: Game, player: KataGoPlayer, led: LEDRenderer = None) -> None:
-    """Renders a human move and immediately lets the engine reply."""
+    """Shows the human move, then lets the engine reply."""
+    # Render before the engine starts thinking so the player sees their own
+    # stone immediately instead of waiting for KataGo's reply.
+    _render(game, led)
     if player is not None and not game.game_state.is_over and game.current_player is player.color:
         _engine_turn(game, player, led)
-    else:
-        _render(game, led)
 
 
 def _print_help(with_engine: bool = False) -> None:
@@ -139,10 +143,122 @@ def _print_help(with_engine: bool = False) -> None:
     )
 
 
+def _start_stdin_reader() -> queue.Queue:
+    """Reads typed commands on a thread so the joystick can stay responsive."""
+    lines = queue.Queue()
+
+    def read_lines():
+        try:
+            for line in sys.stdin:
+                lines.put(line)
+        except (OSError, ValueError):
+            pass
+        finally:
+            lines.put(None)
+
+    threading.Thread(target=read_lines, name="stdin-reader", daemon=True).start()
+    return lines
+
+
+class _JoystickCursor:
+    """Converts polled joystick states into cursor moves and presses.
+
+    The first deflection moves one intersection immediately.  Holding a
+    direction then repeats after a short delay, which makes crossing the
+    board quick without making single steps hard to control.
+    """
+
+    INITIAL_DELAY = 0.35
+    REPEAT_INTERVAL = 0.14
+    BUTTON_DEBOUNCE = 0.20
+
+    DELTAS = {
+        "U": (0, -1),
+        "D": (0, 1),
+        "L": (-1, 0),
+        "R": (1, 0),
+    }
+
+    def __init__(self):
+        self.direction = "0"
+        self.next_repeat = 0.0
+        self.button_down = False
+        self.button_ready = 0.0
+
+    def _move(self, direction: str, game: Game, led: LEDRenderer) -> None:
+        dx, dy = self.DELTAS[direction]
+        game.input_controller.handle_joystick(dx, dy)
+        if led is not None:
+            led.move_cursor(game.board, game.input_controller.position)
+
+    def update(self, state, game: Game, led: LEDRenderer, now: float = None):
+        """Returns ``"press"`` when the button is newly pressed, else None."""
+        if state is None:
+            return None
+
+        direction, pressed = state
+        if now is None:
+            now = time.monotonic()
+
+        if direction != self.direction:
+            self.direction = direction
+            if direction != "0":
+                self._move(direction, game, led)
+                self.next_repeat = now + self.INITIAL_DELAY
+        elif direction != "0" and now >= self.next_repeat:
+            self._move(direction, game, led)
+            self.next_repeat = now + self.REPEAT_INTERVAL
+
+        if pressed:
+            if not self.button_down and now >= self.button_ready:
+                self.button_down = True
+                self.button_ready = now + self.BUTTON_DEBOUNCE
+                return "press"
+        else:
+            self.button_down = False
+        return None
+
+
+def _wait_for_command(
+    prompt: str,
+    transport: SerialLEDTransport,
+    game: Game,
+    led: LEDRenderer,
+    lines: queue.Queue,
+) -> str:
+    """Waits for a typed command or a joystick press.
+
+    Joystick movement is handled here so the cursor keeps moving while the
+    program is waiting at the prompt.
+    """
+    print(prompt, end="", flush=True)
+    joystick = _JoystickCursor()
+
+    while True:
+        try:
+            action = joystick.update(transport.poll_joystick(), game, led)
+        except OSError as error:
+            print(f"\nJoystick error: {error}", file=sys.stderr)
+            return "quit"
+        if action == "press":
+            print()
+            return "press"
+
+        try:
+            line = lines.get(timeout=0.02)
+        except queue.Empty:
+            continue
+        if line is None:
+            raise EOFError
+        return line.rstrip("\r\n")
+
+
 def run_interactive(
     size: int,
     player: KataGoPlayer = None,
     led: LEDRenderer = None,
+    transport: SerialLEDTransport = None,
+    joystick: bool = True,
 ) -> int:
     game = Game(size=size)
     if player is not None:
@@ -164,11 +280,20 @@ def run_interactive(
             player.close()
         return 1
 
+    command_lines = None
+    if joystick and transport is not None:
+        command_lines = _start_stdin_reader()
+
     try:
         while True:
             try:
                 prompt = f"\n{game.current_player.name.title()}> "
-                line = input(prompt)
+                if command_lines is not None:
+                    line = _wait_for_command(
+                        prompt, transport, game, led, command_lines
+                    )
+                else:
+                    line = input(prompt)
             except (EOFError, KeyboardInterrupt):
                 print()
                 return 0
@@ -321,6 +446,12 @@ def main(argv=None) -> int:
         default=True,
         help="blink the LED cursor (default: enabled)",
     )
+    parser.add_argument(
+        "--joystick",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="read the LED board joystick (default: enabled with --led-serial)",
+    )
     args = parser.parse_args(argv)
 
     if args.size < 1:
@@ -373,7 +504,13 @@ def main(argv=None) -> int:
             return 1
 
     try:
-        return run_interactive(args.size, player=player, led=led)
+        return run_interactive(
+            args.size,
+            player=player,
+            led=led,
+            transport=transport,
+            joystick=args.joystick,
+        )
     finally:
         if transport is not None:
             transport.close()

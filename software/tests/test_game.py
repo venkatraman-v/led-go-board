@@ -1,4 +1,7 @@
+import contextlib
+import io
 import json
+import queue
 import subprocess
 import sys
 import tempfile
@@ -12,7 +15,7 @@ from board import Board, Piece  # noqa: E402
 from engine import RulesEngine  # noqa: E402
 from game import Game, InputController  # noqa: E402
 from gamestate import GameState  # noqa: E402
-from main import parse_coordinate  # noqa: E402
+from main import _JoystickCursor, _wait_for_command, parse_coordinate  # noqa: E402
 from renderer import BoardRenderer, LEDRenderer  # noqa: E402
 
 
@@ -207,6 +210,73 @@ class InputOutputTests(unittest.TestCase):
         self.assertEqual(parse_coordinate("4,5"), (4, 5))
         with self.assertRaises(ValueError):
             parse_coordinate("nope")
+
+
+class JoystickCursorTests(unittest.TestCase):
+    def test_direction_moves_immediately_then_repeats_after_a_delay(self):
+        class RecordingLED:
+            def __init__(self):
+                self.moves = []
+
+            def move_cursor(self, board, cursor):
+                self.moves.append(cursor)
+
+        game = Game(size=5)
+        led = RecordingLED()
+        joystick = _JoystickCursor()
+
+        self.assertIsNone(joystick.update(("R", False), game, led, now=0.0))
+        self.assertEqual(game.input_controller.position, (1, 0))
+
+        # Still inside the initial repeat delay.
+        self.assertIsNone(joystick.update(("R", False), game, led, now=0.10))
+        self.assertEqual(game.input_controller.position, (1, 0))
+
+        # The held direction now repeats.
+        self.assertIsNone(joystick.update(("R", False), game, led, now=0.40))
+        self.assertEqual(game.input_controller.position, (2, 0))
+        self.assertEqual(led.moves, [(1, 0), (2, 0)])
+
+    def test_button_presses_once_per_click(self):
+        game = Game(size=5)
+        joystick = _JoystickCursor()
+
+        self.assertEqual(joystick.update(("0", True), game, None, now=0.0), "press")
+        self.assertIsNone(joystick.update(("0", True), game, None, now=0.1))
+        self.assertIsNone(joystick.update(("0", False), game, None, now=0.2))
+        self.assertEqual(joystick.update(("0", True), game, None, now=0.3), "press")
+
+    def test_joystick_press_becomes_the_press_command(self):
+        class FakeTransport:
+            def poll_joystick(self):
+                return ("0", True)
+
+        game = Game(size=5)
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = _wait_for_command(
+                "> ", FakeTransport(), game, None, queue.Queue()
+            )
+
+        self.assertEqual(result, "press")
+
+    def test_joystick_moves_before_a_typed_command_is_returned(self):
+        class FakeTransport:
+            def __init__(self):
+                self.calls = 0
+
+            def poll_joystick(self):
+                self.calls += 1
+                return ("R", False) if self.calls == 1 else None
+
+        game = Game(size=5)
+        lines = queue.Queue()
+        lines.put("play A1\n")
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = _wait_for_command("> ", FakeTransport(), game, None, lines)
+
+        self.assertEqual(result, "play A1")
+        self.assertEqual(game.input_controller.position, (1, 0))
 
 
 class MainEntryPointTests(unittest.TestCase):

@@ -102,6 +102,44 @@ class BoardRenderer:
         return text
 
 
+def matrix_layout(matrix_size: int, size: int) -> tuple:
+    """Returns ``(tile, offset)`` for drawing a board on the LED matrix.
+
+    The 32x32 panels are scanned as two 16-row halves, and the libraries do
+    not always render a tile split across that seam correctly.  Keep the
+    centred layout when possible, but nudge it up or down so no tile crosses
+    the half-panel boundary.  When the tiles are too large for that to be
+    possible (for example a 3x3 board with 10x10 tiles) the centred layout is
+    used unchanged.
+    """
+    if matrix_size < size:
+        raise ValueError("matrix must be at least as large as the board")
+
+    tile = max(1, matrix_size // size)
+    span = tile * size
+    offset = max(0, (matrix_size - span) // 2)
+    seam = matrix_size // 2
+
+    def crosses_seam(value: int) -> bool:
+        return any(
+            value + row * tile < seam < value + row * tile + tile
+            for row in range(size)
+        )
+
+    if tile > 1 and crosses_seam(offset):
+        candidates = [
+            value
+            for value in range(0, matrix_size - span + 1)
+            if not crosses_seam(value)
+        ]
+        if candidates:
+            # Prefer the offset closest to the centred layout; break ties
+            # towards the upper half for a stable, reproducible frame.
+            offset = min(candidates, key=lambda value: (abs(value - offset), value))
+
+    return tile, offset
+
+
 class LEDRenderer:
     """Renders the board into a square LED-matrix frame.
 
@@ -129,9 +167,7 @@ class LEDRenderer:
         size = board.size
         if self.matrix_size < size:
             raise ValueError("matrix must be at least as large as the board")
-        tile = max(1, self.matrix_size // size)
-        span = tile * size
-        offset = max(0, (self.matrix_size - span) // 2)
+        tile, offset = matrix_layout(self.matrix_size, size)
         frame = [
             [self.EMPTY for _ in range(self.matrix_size)]
             for _ in range(self.matrix_size)
@@ -164,6 +200,12 @@ class LEDRenderer:
             self.write(self.encode(frame))
         return frame
 
+    def move_cursor(self, board: Board, cursor: tuple | None) -> None:
+        """Moves the LED cursor without sending a full frame."""
+        move = getattr(self.transport, "move_cursor", None)
+        if move is not None:
+            move(board, cursor)
+
 
 class SerialLEDTransport:
     """Sends board positions to Nathan's Arduino firmware over a serial port.
@@ -174,9 +216,11 @@ class SerialLEDTransport:
     * ``C`` — clear the panel
     * ``S x y size r g b 1`` — draw a filled square
     * ``P x y r g b`` — draw one pixel
+    * ``J`` — read the joystick state (``J <U|D|L|R|0> <0|1>``)
 
     The cursor blinks by toggling just its own pixels, so the rest of the
-    board is not redrawn.
+    board is not redrawn.  It can also be moved without redrawing the whole
+    board, which keeps joystick movement responsive.
 
     Each intersection is drawn as a centred tile.  Blue stones use blue,
     red stones use red, and the cursor uses grey on an empty point or a white
@@ -247,10 +291,7 @@ class SerialLEDTransport:
             self._blink_thread.start()
 
     def _layout(self, size: int) -> tuple:
-        tile = max(1, self.matrix_size // size)
-        span = tile * size
-        offset = max(0, (self.matrix_size - span) // 2)
-        return tile, offset
+        return matrix_layout(self.matrix_size, size)
 
     def _wait_for_ready(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
@@ -315,6 +356,42 @@ class SerialLEDTransport:
         self.serial.flush()
         self._wait_for_ack(command, self.ack_timeout)
 
+    def poll_joystick(self, timeout: float = 0.3) -> tuple | None:
+        """Returns ``(direction, pressed)`` or ``None``.
+
+        ``direction`` is one of ``U``, ``D``, ``L``, ``R`` or ``0``.  The
+        firmware replies to a ``J`` command with ``J <direction> <0|1>``.
+        The serial transaction is locked so it cannot interleave with the
+        cursor-blink thread.
+        """
+        with self._lock:
+            previous_timeout = getattr(self.serial, "timeout", None)
+            try:
+                if previous_timeout is not None:
+                    # Keep a missing reply from stalling the input loop.
+                    self.serial.timeout = min(previous_timeout, 0.05)
+                self.serial.write(b"J\n")
+                self.serial.flush()
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    raw = self.serial.readline()
+                    if not raw:
+                        continue
+                    line = raw.decode("ascii", "replace").strip()
+                    if not line.startswith("J "):
+                        continue
+                    parts = line.split()
+                    if len(parts) < 3:
+                        continue
+                    direction = parts[1].upper()
+                    if direction not in ("U", "D", "L", "R"):
+                        direction = "0"
+                    return direction, parts[2] != "0"
+                return None
+            finally:
+                if previous_timeout is not None:
+                    self.serial.timeout = previous_timeout
+
     def _remember_cursor(self, board: Board, cursor: tuple | None) -> None:
         if cursor is None:
             self._cursor = None
@@ -356,6 +433,43 @@ class SerialLEDTransport:
             command = f"S {px} {py} {tile} 0 0 0 1"
 
         self._write_acked(command.encode("ascii"))
+
+    def _draw_point(self, board: Board, point: tuple, size: int = None) -> None:
+        """Redraws one intersection, including clearing an empty point."""
+        if size is None:
+            size = board.size
+        tile, offset = self._layout(size)
+        x, y = point
+        piece = board.stone_at(x, y)
+        if piece is Piece.BLUE:
+            red, green, blue = self.BLUE_RGB
+        elif piece is Piece.RED:
+            red, green, blue = self.RED_RGB
+        else:
+            red, green, blue = (0, 0, 0)
+        px = offset + x * tile
+        py = offset + y * tile
+        self._write_acked(
+            f"S {px} {py} {tile} {red} {green} {blue} 1".encode("ascii")
+        )
+
+    def move_cursor(self, board: Board, cursor: tuple | None) -> None:
+        """Moves the cursor without redrawing the whole board.
+
+        Joystick movement can therefore update the panel at button-repeat
+        speed instead of taking a full-frame serial transfer per step.
+        """
+        with self._lock:
+            old = self._cursor
+            old_size = self._cursor_size
+            self._remember_cursor(board, cursor)
+            if old == self._cursor:
+                return
+            if old is not None:
+                self._draw_point(board, old, old_size)
+            if self._cursor is not None:
+                self._blink_visible = True
+                self._write_cursor()
 
     def _blink_loop(self) -> None:
         while not self._blink_stop.wait(self._blink_interval):

@@ -1,3 +1,5 @@
+import contextlib
+import io
 import sys
 import threading
 import unittest
@@ -16,7 +18,7 @@ from analysis import (  # noqa: E402
 from board import Board, Piece  # noqa: E402
 from game import Game  # noqa: E402
 from gamestate import GameState  # noqa: E402
-from renderer import LEDRenderer, SerialLEDTransport  # noqa: E402
+from renderer import LEDRenderer, SerialLEDTransport, matrix_layout  # noqa: E402
 
 
 class FakeEngine:
@@ -244,8 +246,10 @@ class SerialLEDTransportTests(unittest.TestCase):
         lines = self._transport(brightness=4).encode(board).decode("ascii").splitlines()
 
         self.assertEqual(lines[0], "B 4")
-        self.assertIn("S 3 3 2 0 0 7 1", lines)
-        self.assertIn("S 27 27 2 7 0 0 1", lines)
+        # The seam-aware layout shifts the centred block by one pixel so the
+        # 2x2 tiles never straddle the panel's 16-row half boundary.
+        self.assertIn("S 2 2 2 0 0 7 1", lines)
+        self.assertIn("S 26 26 2 7 0 0 1", lines)
 
     def test_encode_skips_empty_points(self):
         lines = self._transport().encode(Board(5)).decode("ascii").splitlines()
@@ -376,6 +380,151 @@ class SerialLEDTransportTests(unittest.TestCase):
         transport.serial = ErrorSerial()
         with self.assertRaises(OSError):
             transport.send(Board(5))
+
+    def test_poll_joystick_parses_the_firmware_reply(self):
+        class FakeSerial:
+            def __init__(self):
+                self.written = b""
+
+            def write(self, data):
+                self.written += data
+
+            def flush(self):
+                pass
+
+            def readline(self):
+                return b"J R 1\r\n"
+
+        transport = self._transport()
+        transport.serial = FakeSerial()
+
+        self.assertEqual(transport.poll_joystick(), ("R", True))
+        self.assertEqual(transport.serial.written, b"J\n")
+
+    def test_poll_joystick_ignores_unrelated_replies(self):
+        class FakeSerial:
+            def __init__(self):
+                self.lines = [b"OK\r\n", b"J 0 0\r\n"]
+
+            def write(self, data):
+                pass
+
+            def flush(self):
+                pass
+
+            def readline(self):
+                return self.lines.pop(0) if self.lines else b""
+
+        transport = self._transport()
+        transport.serial = FakeSerial()
+
+        self.assertEqual(transport.poll_joystick(), ("0", False))
+
+    def test_move_cursor_redraws_only_the_old_and_new_points(self):
+        class FakeSerial:
+            def __init__(self):
+                self.written = b""
+
+            def write(self, data):
+                self.written += data
+
+            def flush(self):
+                pass
+
+            def readline(self):
+                return b"OK\r\n"
+
+        transport = self._transport()
+        transport.serial = FakeSerial()
+        board = Board(5)
+
+        transport.move_cursor(board, (1, 1))
+        transport.serial.written = b""
+        transport.move_cursor(board, (2, 1))
+
+        # A 5x5 board uses 6x6 tiles with a one-pixel offset: (1,1) is at
+        # (7,7) and (2,1) is at (13,7).  Only those two points are touched.
+        self.assertEqual(
+            transport.serial.written,
+            b"S 7 7 6 0 0 0 1\nS 13 7 6 4 4 4 1\n",
+        )
+
+
+class MatrixLayoutTests(unittest.TestCase):
+    def test_13x13_tiles_do_not_cross_the_half_panel_seam(self):
+        tile, offset = matrix_layout(32, 13)
+        seam = 32 // 2
+
+        self.assertEqual((tile, offset), (2, 2))
+        for row in range(13):
+            start = offset + row * tile
+            self.assertFalse(
+                start < seam < start + tile,
+                f"board row {row + 1} crosses the panel seam",
+            )
+
+    def test_small_board_keeps_the_centred_layout(self):
+        # Three 10x10 tiles cannot avoid the seam in either direction, so the
+        # helper must leave the traditional centred offset alone.
+        self.assertEqual(matrix_layout(32, 3), (10, 1))
+
+    def test_led_frame_uses_the_seam_aware_layout(self):
+        board = Board(13)
+        board.place_stone(0, 0, Piece.BLUE)
+
+        frame = LEDRenderer().frame(board)
+
+        # Offset 2 puts the top-left 2x2 tile on rows 2-3, not rows 3-4.
+        self.assertEqual(frame[2][2], LEDRenderer.BLUE)
+        self.assertEqual(frame[3][3], LEDRenderer.BLUE)
+        self.assertEqual(frame[1][1], LEDRenderer.EMPTY)
+
+
+class TurnOrderTests(unittest.TestCase):
+    def test_human_move_is_rendered_before_the_engine_thinks(self):
+        from main import _finish_turn
+
+        class RecordingLED:
+            def __init__(self):
+                self.frames = []
+
+            def render(self, board, cursor=None):
+                self.frames.append(
+                    (board.stone_at(1, 1), board.stone_at(0, 0))
+                )
+
+        class RecordingPlayer:
+            color = Piece.RED
+            name = "Fake"
+
+            def __init__(self, led, events):
+                self.led = led
+                self.events = events
+
+            def make_move(self, game):
+                # The human stone must already be on the panel when the
+                # engine starts thinking.
+                self.events.append(("engine", len(self.led.frames)))
+                game.play_move(0, 0)
+                return EngineMove(x=0, y=0, raw="A1")
+
+        led = RecordingLED()
+        events = []
+        player = RecordingPlayer(led, events)
+        game = Game(size=5)
+        game.play_move(1, 1)  # Human (Blue) move
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            _finish_turn(game, player, led)
+
+        self.assertEqual(events, [("engine", 1)])
+        self.assertEqual(
+            led.frames,
+            [
+                (Piece.BLUE, Piece.EMPTY),  # human move shown first
+                (Piece.BLUE, Piece.RED),    # engine reply shown after
+            ],
+        )
 
 
 if __name__ == "__main__":

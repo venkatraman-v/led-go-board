@@ -20,6 +20,29 @@ RGBmatrixPanel matrix(A, B, C, D, CLK, LAT, OE, false);
 // Global brightness setting: 1 to 7 (1 is lowest/dimmest/battery-safe, 7 is maximum)
 uint8_t globalBrightness = 1;
 
+// ============================================================================
+// Joystick Pin Configuration
+// ============================================================================
+// All other digital pins are used by the RGB panel, so A4/A5 are the only
+// free analog inputs.  The button may be wired to any of the free digital
+// pins 11-13; all three are read with pull-ups.
+#define JOY_X_PIN A4
+#define JOY_Y_PIN A5
+#define JOY_BUTTON_1 11
+#define JOY_BUTTON_2 12
+#define JOY_BUTTON_3 13
+
+#define JOY_CENTRE 512
+#define JOY_DEADZONE 180
+// On this board the push button shares the X analog line and pulls it to the
+// top rail when pressed.  Normal stick movement stays well below this level.
+#define JOY_BUTTON_X 900
+#define JOY_X_INVERT 1
+#define JOY_Y_INVERT 0
+
+// Captured at boot so the button works whether it switches to ground or VCC.
+uint8_t joyButtonIdle = 0;
+
 // Serial reception buffer
 char rxBuf[32];
 uint8_t rxIdx = 0;
@@ -62,6 +85,56 @@ void clearPixel(int16_t x, int16_t y) {
 // Clear entire board
 void clearBoard() {
   matrix.fillScreen(matrix.Color333(0, 0, 0));
+}
+
+// ============================================================================
+// JOYSTICK
+// ============================================================================
+
+uint8_t joystickButtonBits() {
+  return (digitalRead(JOY_BUTTON_1) << 0) |
+         (digitalRead(JOY_BUTTON_2) << 1) |
+         (digitalRead(JOY_BUTTON_3) << 2);
+}
+
+struct JoystickState {
+  char direction;
+  bool button;
+};
+
+JoystickState readJoystick() {
+  long sumX = 0, sumY = 0;
+  bool analogButton = false;
+
+  // Sample both axes together.  If any X sample reaches the top rail the
+  // button is down; this also keeps a button press from looking like "right".
+  for (uint8_t i = 0; i < 6; i++) {
+    int rawX = analogRead(JOY_X_PIN);
+    int rawY = analogRead(JOY_Y_PIN);
+    if (rawX >= JOY_BUTTON_X) analogButton = true;
+    sumX += rawX;
+    sumY += rawY;
+  }
+
+  int x = (sumX / 6) - JOY_CENTRE;
+  int y = (sumY / 6) - JOY_CENTRE;
+#if JOY_X_INVERT
+  x = -x;
+#endif
+#if JOY_Y_INVERT
+  y = -y;
+#endif
+
+  JoystickState state;
+  state.button = analogButton || (joystickButtonBits() != joyButtonIdle);
+  if (state.button || (abs(x) < JOY_DEADZONE && abs(y) < JOY_DEADZONE)) {
+    state.direction = '0';
+  } else if (abs(x) >= abs(y)) {
+    state.direction = x < 0 ? 'L' : 'R';
+  } else {
+    state.direction = y < 0 ? 'U' : 'D';
+  }
+  return state;
 }
 
 // Draw line
@@ -183,6 +256,25 @@ void processCommand(char* buf) {
     setBrightness(val);
     Serial.println(F("OK"));
   }
+  // 'J' -> report joystick direction and button state
+  //        "J <U|D|L|R|0> <0|1>"
+  else if (cmd == 'J' || cmd == 'j') {
+    JoystickState state = readJoystick();
+    Serial.print(F("J "));
+    Serial.print(state.direction);
+    Serial.print(' ');
+    Serial.println(state.button ? '1' : '0');
+  }
+  // 'K' -> raw joystick diagnostic
+  //        "K <x> <y> <button bits>"
+  else if (cmd == 'K' || cmd == 'k') {
+    Serial.print(F("K "));
+    Serial.print(analogRead(JOY_X_PIN));
+    Serial.print(' ');
+    Serial.print(analogRead(JOY_Y_PIN));
+    Serial.print(' ');
+    Serial.println(joystickButtonBits());
+  }
   // '?' / PING
   else if (cmd == '?' || cmd == 'q' || cmd == 'Q') {
     Serial.println(F("READY"));
@@ -214,6 +306,10 @@ void checkSerial() {
 // ============================================================================
 void setup() {
   Serial.begin(115200);
+  pinMode(JOY_BUTTON_1, INPUT_PULLUP);
+  pinMode(JOY_BUTTON_2, INPUT_PULLUP);
+  pinMode(JOY_BUTTON_3, INPUT_PULLUP);
+  joyButtonIdle = joystickButtonBits();
   matrix.begin();
   clearBoard();
   Serial.println(F("READY"));

@@ -38,6 +38,22 @@ Interactive commands:
 The board is drawn with `B` for blue and `R` for red.  The joystick cursor is
 shown as `+` on an empty point, or as a lowercase `b`/`r` over a stone.
 
+## Joystick
+
+With `--led-serial`, the firmware reports the analog stick and button over the
+same serial connection.  The stick axes are read on **A4 (X)** and **A5 (Y)**.
+The button may be wired to **A4**, **D11**, **D12**, or **D13**; on this board
+the button shares A4 with the X axis and pulls it to the top rail when pressed.
+
+- Tilting the stick moves the cursor one intersection immediately.
+- Holding a direction repeats after 0.35 s at about seven steps per second.
+- Pressing the button plays at the cursor and, against KataGo, immediately
+  starts the engine reply.
+- Use `--no-joystick` to disable hardware input.
+
+Only the cursor changes are sent while the stick moves, so movement stays
+responsive even on a full board.
+
 ## Playing KataGo
 
 KataGo is driven over GTP in a subprocess.  Before every engine move the full
@@ -105,13 +121,16 @@ The firmware listens for newline-terminated text commands and replies `OK`:
 | `S x y size r g b [fill]` | Draw a square, filled by default |
 | `T x0 y0 x1 y1 x2 y2 r g b [fill]` | Draw a triangle |
 | `B n` | Set brightness (`1`–`7`) |
+| `J` | Return joystick state: `J <U\|D\|L\|R\|0> <0\|1>` |
+| `K` | Return raw joystick diagnostics: `K <x> <y> <button bits>` |
 | `?` | Return `READY` |
 
 For each board update the Python transport sends `B`, then `C`, then one
 filled `S` command per stone or cursor.  Each intersection is a centred tile,
-so a 13×13 board becomes 2×2 blocks on the 32×32 panel.  The cursor is a grey
-tile on an empty point, or a white pixel on top of a stone.  Upload the
-firmware with PlatformIO:
+so a 13×13 board becomes 2×2 blocks on the 32×32 panel.  The layout is shifted
+by one pixel when needed so no tile straddles the seam between the panel's two
+16-row halves.  The cursor is a grey tile on an empty point, or a white pixel
+on top of a stone.  Upload the firmware with PlatformIO:
 
 ```bash
 cd firmware
