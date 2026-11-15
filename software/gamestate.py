@@ -47,11 +47,12 @@ class GameState:
         self.ko_point = None
         self.consecutive_passes = 0
         self.captured = {Piece.BLUE: 0, Piece.RED: 0}
+        self.resigned_by = None
 
     @property
     def is_over(self) -> bool:
-        """The game ends after two consecutive passes."""
-        return self.consecutive_passes >= 2
+        """The game ends on resignation or after two consecutive passes."""
+        return self.resigned_by is not None or self.consecutive_passes >= 2
 
     @property
     def last_move(self) -> Optional[Move]:
@@ -115,8 +116,18 @@ class GameState:
         self.current_player = color.opponent
         return True
 
+    def resign(self, color: Optional[Piece] = None) -> bool:
+        """Ends the game by resignation for ``color`` (default: current player)."""
+        if self.is_over:
+            return False
+        self.resigned_by = color or self.current_player
+        return True
+
     def undo_move(self) -> bool:
-        """Restores the position before the most recent move or pass."""
+        """Undoes the most recent move, pass, or resignation."""
+        if self.resigned_by is not None:
+            self.resigned_by = None
+            return True
         if not self.history:
             return False
 
@@ -136,6 +147,7 @@ class GameState:
                 {"color": move.color.name, "x": move.x, "y": move.y}
                 for move in self.history
             ],
+            "resigned_by": self.resigned_by.name if self.resigned_by else None,
         }
 
     @classmethod
@@ -154,4 +166,7 @@ class GameState:
                     raise ValueError("invalid pass in move list")
             elif not state.play_move(x, y):
                 raise ValueError(f"illegal move in move list: {entry}")
+        resigned_by = data.get("resigned_by")
+        if resigned_by:
+            state.resigned_by = Piece[resigned_by]
         return state

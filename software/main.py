@@ -3,9 +3,15 @@ import re
 import shlex
 import sys
 
+from analysis import KataGoError, KataGoPlayer
 from board import Board, Piece
 from game import Game
-from renderer import BoardRenderer, format_coordinate
+from renderer import (
+    BoardRenderer,
+    LEDRenderer,
+    SerialLEDTransport,
+    format_coordinate,
+)
 
 
 def demo_moves(size: int) -> list:
@@ -69,11 +75,54 @@ def run_demo(size: int) -> int:
     return 0 if captured == 1 else 1
 
 
-def _render(game: Game) -> None:
-    game.render(cursor=game.input_controller.position)
+def _render(game: Game, led: LEDRenderer = None) -> None:
+    cursor = game.input_controller.position
+    game.render(cursor=cursor)
+    if led is not None:
+        led.render(game.board, cursor=cursor)
 
 
-def _print_help() -> None:
+def _engine_turn(game: Game, player: KataGoPlayer, led: LEDRenderer = None) -> bool:
+    """Lets KataGo move if it is its turn.  Returns True if it moved."""
+    if player is None or game.game_state.is_over:
+        return False
+    if game.current_player is not player.color:
+        return False
+
+    print(f"\n{player.name} is thinking...")
+    try:
+        decision = player.make_move(game)
+    except KataGoError as error:
+        print(f"{player.name} error: {error}")
+        return False
+
+    if decision.resigned:
+        print(f"{player.name} resigned.")
+    elif decision.passed:
+        print(f"{player.name} passed.")
+    else:
+        print(
+            f"{player.name} played "
+            f"{format_coordinate(decision.x, decision.y)}."
+        )
+    _render(game, led)
+    return True
+
+
+def _finish_turn(game: Game, player: KataGoPlayer, led: LEDRenderer = None) -> None:
+    """Renders a human move and immediately lets the engine reply."""
+    if player is not None and not game.game_state.is_over and game.current_player is player.color:
+        _engine_turn(game, player, led)
+    else:
+        _render(game, led)
+
+
+def _print_help(with_engine: bool = False) -> None:
+    engine_line = (
+        "  engine               ask KataGo to move when it is its turn\n"
+        if with_engine
+        else ""
+    )
     print(
         "\nCommands:\n"
         "  play A1 / play 4 5   play at a labelled or zero-based coordinate\n"
@@ -83,107 +132,145 @@ def _print_help() -> None:
         "  pass                 pass the turn\n"
         "  undo                 undo the last move\n"
         "  save FILE / load FILE  write or read a JSON move list\n"
-        "  show                 redraw the board\n"
+        + engine_line
+        + "  show                 redraw the board\n"
         "  help                 show this help\n"
         "  quit                 exit\n"
     )
 
 
-def run_interactive(size: int) -> int:
+def run_interactive(
+    size: int,
+    player: KataGoPlayer = None,
+    led: LEDRenderer = None,
+) -> int:
     game = Game(size=size)
-    print("LED Go board. Type 'help' for commands.\n")
-    _render(game)
+    if player is not None:
+        print(
+            f"Playing against {player.name} ({player.color.name.title()}). "
+            "Type 'help' for commands.\n"
+        )
+    else:
+        print("LED Go board. Type 'help' for commands.\n")
 
-    while True:
-        try:
-            prompt = f"\n{game.current_player.name.title()}> "
-            line = input(prompt)
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return 0
+    try:
+        _render(game, led)
 
-        try:
-            tokens = shlex.split(line)
-        except ValueError as error:
-            print(f"Input error: {error}")
-            continue
-        if not tokens:
-            continue
+        # KataGo may be playing Blue, in which case it opens the game.
+        _engine_turn(game, player, led)
+    except OSError as error:
+        print(f"LED/serial error: {error}", file=sys.stderr)
+        if player is not None:
+            player.close()
+        return 1
 
-        command = tokens[0].lower()
-        args = tokens[1:]
-
-        try:
-            if command in ("quit", "exit"):
+    try:
+        while True:
+            try:
+                prompt = f"\n{game.current_player.name.title()}> "
+                line = input(prompt)
+            except (EOFError, KeyboardInterrupt):
+                print()
                 return 0
-            elif command == "help":
-                _print_help()
-            elif command in ("show", "board"):
-                _render(game)
-            elif command in ("play", "move"):
-                if len(args) == 1:
-                    x, y = parse_coordinate(args[0])
-                elif len(args) == 2:
-                    x, y = int(args[0]), int(args[1])
+
+            try:
+                tokens = shlex.split(line)
+            except ValueError as error:
+                print(f"Input error: {error}")
+                continue
+            if not tokens:
+                continue
+
+            command = tokens[0].lower()
+            args = tokens[1:]
+
+            try:
+                if command in ("quit", "exit"):
+                    return 0
+                elif command == "help":
+                    _print_help(with_engine=player is not None)
+                elif command in ("show", "board"):
+                    _render(game, led)
+                elif command in ("play", "move"):
+                    if len(args) == 1:
+                        x, y = parse_coordinate(args[0])
+                    elif len(args) == 2:
+                        x, y = int(args[0]), int(args[1])
+                    else:
+                        raise ValueError("usage: play A1 or play X Y")
+                    color = game.current_player
+                    if game.play_move(x, y):
+                        print(
+                            f"{color.name.title()} played "
+                            f"{format_coordinate(x, y)}."
+                        )
+                        _finish_turn(game, player, led)
+                    else:
+                        print("Illegal move (occupied, suicide, ko, or game over).")
+                elif command in ("up", "down", "left", "right"):
+                    step = int(args[0]) if args else 1
+                    deltas = {
+                        "up": (0, -step),
+                        "down": (0, step),
+                        "left": (-step, 0),
+                        "right": (step, 0),
+                    }
+                    game.input_controller.handle_joystick(*deltas[command])
+                    _render(game, led)
+                elif command in ("goto", "cursor"):
+                    if len(args) != 1:
+                        raise ValueError("usage: goto A1")
+                    game.input_controller.set_position(*parse_coordinate(args[0]))
+                    _render(game, led)
+                elif command == "press":
+                    color = game.current_player
+                    x, y = game.input_controller.position
+                    if game.input_controller.handle_button_press():
+                        print(
+                            f"{color.name.title()} played "
+                            f"{format_coordinate(x, y)}."
+                        )
+                        _finish_turn(game, player, led)
+                    else:
+                        print("Illegal move (occupied, suicide, ko, or game over).")
+                elif command == "pass":
+                    color = game.current_player
+                    if game.pass_move():
+                        print(f"{color.name.title()} passed.")
+                        _finish_turn(game, player, led)
+                    else:
+                        print("The game is already over.")
+                elif command in ("engine", "ai"):
+                    if player is None:
+                        print("No engine is configured; start with --vs-katago.")
+                    elif game.current_player is not player.color:
+                        print(f"It is {game.current_player.name.title()}'s turn.")
+                    elif not _engine_turn(game, player, led):
+                        print("KataGo could not move.")
+                elif command == "undo":
+                    if game.undo_move():
+                        print("Undid the last move.")
+                        _finish_turn(game, player, led)
+                    else:
+                        print("Nothing to undo.")
+                elif command == "save":
+                    if len(args) != 1:
+                        raise ValueError("usage: save FILE")
+                    game.save(args[0])
+                    print(f"Saved {len(game.game_state.history)} moves to {args[0]}.")
+                elif command == "load":
+                    if len(args) != 1:
+                        raise ValueError("usage: load FILE")
+                    game.load(args[0])
+                    print(f"Loaded {len(game.game_state.history)} moves from {args[0]}.")
+                    _finish_turn(game, player, led)
                 else:
-                    raise ValueError("usage: play A1 or play X Y")
-                color = game.current_player
-                if game.play_move(x, y):
-                    print(f"{color.name.title()} played {format_coordinate(x, y)}.")
-                    _render(game)
-                else:
-                    print("Illegal move (occupied, suicide, ko, or game over).")
-            elif command in ("up", "down", "left", "right"):
-                step = int(args[0]) if args else 1
-                deltas = {
-                    "up": (0, -step),
-                    "down": (0, step),
-                    "left": (-step, 0),
-                    "right": (step, 0),
-                }
-                game.input_controller.handle_joystick(*deltas[command])
-                _render(game)
-            elif command in ("goto", "cursor"):
-                if len(args) != 1:
-                    raise ValueError("usage: goto A1")
-                game.input_controller.set_position(*parse_coordinate(args[0]))
-                _render(game)
-            elif command == "press":
-                color = game.current_player
-                x, y = game.input_controller.position
-                if game.input_controller.handle_button_press():
-                    print(f"{color.name.title()} played {format_coordinate(x, y)}.")
-                    _render(game)
-                else:
-                    print("Illegal move (occupied, suicide, ko, or game over).")
-            elif command == "pass":
-                color = game.current_player
-                if game.pass_move():
-                    print(f"{color.name.title()} passed.")
-                    _render(game)
-                else:
-                    print("The game is already over.")
-            elif command == "undo":
-                if game.undo_move():
-                    print("Undid the last move.")
-                    _render(game)
-                else:
-                    print("Nothing to undo.")
-            elif command == "save":
-                if len(args) != 1:
-                    raise ValueError("usage: save FILE")
-                game.save(args[0])
-                print(f"Saved {len(game.game_state.history)} moves to {args[0]}.")
-            elif command == "load":
-                if len(args) != 1:
-                    raise ValueError("usage: load FILE")
-                game.load(args[0])
-                print(f"Loaded {len(game.game_state.history)} moves from {args[0]}.")
-                _render(game)
-            else:
-                print(f"Unknown command: {command!r}. Type 'help' for commands.")
-        except (ValueError, OSError) as error:
-            print(f"Error: {error}")
+                    print(f"Unknown command: {command!r}. Type 'help' for commands.")
+            except (ValueError, OSError) as error:
+                print(f"Error: {error}")
+    finally:
+        if player is not None:
+            player.close()
 
 
 def main(argv=None) -> int:
@@ -196,17 +283,100 @@ def main(argv=None) -> int:
     mode.add_argument(
         "--interactive", action="store_true", help="read commands from standard input"
     )
+    parser.add_argument(
+        "--vs-katago", action="store_true", help="play against a KataGo engine"
+    )
+    parser.add_argument(
+        "--ai-color",
+        choices=("blue", "red"),
+        default="red",
+        help="colour KataGo plays (default: red)",
+    )
+    parser.add_argument(
+        "--visits", type=int, default=100, help="KataGo search visits per move"
+    )
+    parser.add_argument("--komi", type=float, default=7.5, help="KataGo komi")
+    parser.add_argument("--katago", help="path to the KataGo executable")
+    parser.add_argument("--model", help="path to the KataGo .bin.gz network")
+    parser.add_argument("--config", help="path to the KataGo GTP config")
+    parser.add_argument(
+        "--led-serial",
+        metavar="PORT",
+        help="serial port for the LED matrix (e.g. /dev/ttyACM0)",
+    )
+    parser.add_argument(
+        "--led-baud", type=int, default=115200, help="LED serial baud rate"
+    )
+    parser.add_argument(
+        "--led-brightness",
+        type=int,
+        choices=range(1, 8),
+        default=1,
+        metavar="1-7",
+        help="LED brightness, 1 (dimmest) to 7 (brightest)",
+    )
+    parser.add_argument(
+        "--led-blink",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="blink the LED cursor (default: enabled)",
+    )
     args = parser.parse_args(argv)
 
     if args.size < 1:
         parser.error("--size must be positive")
+    if args.visits < 1:
+        parser.error("--visits must be positive")
+    if args.demo and args.vs_katago:
+        parser.error("--demo cannot be combined with --vs-katago")
 
-    interactive = args.interactive or (not args.demo and sys.stdin.isatty())
-    if interactive:
-        return run_interactive(args.size)
-    if args.size < 5:
-        parser.error("--size must be at least 5 in demo mode")
-    return run_demo(args.size)
+    interactive = args.interactive or args.vs_katago or (
+        not args.demo and sys.stdin.isatty()
+    )
+    if not interactive:
+        if args.size < 5:
+            parser.error("--size must be at least 5 in demo mode")
+        return run_demo(args.size)
+
+    player = None
+    if args.vs_katago:
+        color = Piece.BLUE if args.ai_color == "blue" else Piece.RED
+        try:
+            player = KataGoPlayer(
+                color=color,
+                binary=args.katago,
+                model=args.model,
+                config=args.config,
+                board_size=args.size,
+                komi=args.komi,
+                max_visits=args.visits,
+            )
+        except KataGoError as error:
+            print(f"Could not start KataGo: {error}", file=sys.stderr)
+            return 1
+
+    transport = None
+    led = None
+    if args.led_serial:
+        try:
+            transport = SerialLEDTransport(
+                args.led_serial,
+                baudrate=args.led_baud,
+                brightness=args.led_brightness,
+                blink=args.led_blink,
+            )
+            led = LEDRenderer(transport=transport)
+        except (RuntimeError, OSError) as error:
+            if player is not None:
+                player.close()
+            print(f"Could not open LED serial port: {error}", file=sys.stderr)
+            return 1
+
+    try:
+        return run_interactive(args.size, player=player, led=led)
+    finally:
+        if transport is not None:
+            transport.close()
 
 
 if __name__ == "__main__":
