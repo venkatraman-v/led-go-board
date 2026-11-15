@@ -82,7 +82,11 @@ def _render(game: Game, led: LEDRenderer = None) -> None:
     cursor = game.input_controller.position
     game.render(cursor=cursor)
     if led is not None:
-        led.render(game.board, cursor=cursor)
+        led.render(
+            game.board,
+            cursor=cursor,
+            captured=game.game_state.captured,
+        )
 
 
 def _engine_turn(game: Game, player: KataGoPlayer, led: LEDRenderer = None) -> bool:
@@ -161,16 +165,21 @@ def _start_stdin_reader() -> queue.Queue:
 
 
 class _JoystickCursor:
-    """Converts polled joystick states into cursor moves and presses.
+    """Converts polled joystick states into cursor moves and actions.
 
     The first deflection moves one intersection immediately.  Holding a
     direction then repeats after a short delay, which makes crossing the
     board quick without making single steps hard to control.
+
+    A short press of the joystick button plays at the cursor.  Holding it for
+    :attr:`PASS_HOLD` seconds passes the turn instead.  An optional dedicated
+    pass button on D11-D13 reports its own state and always passes.
     """
 
     INITIAL_DELAY = 0.35
     REPEAT_INTERVAL = 0.14
     BUTTON_DEBOUNCE = 0.20
+    PASS_HOLD = 0.90
 
     DELTAS = {
         "U": (0, -1),
@@ -183,7 +192,11 @@ class _JoystickCursor:
         self.direction = "0"
         self.next_repeat = 0.0
         self.button_down = False
+        self.button_started = 0.0
         self.button_ready = 0.0
+        self.button_passed = False
+        self.pass_down = False
+        self.pass_ready = 0.0
 
     def _move(self, direction: str, game: Game, led: LEDRenderer) -> None:
         dx, dy = self.DELTAS[direction]
@@ -192,11 +205,15 @@ class _JoystickCursor:
             led.move_cursor(game.board, game.input_controller.position)
 
     def update(self, state, game: Game, led: LEDRenderer, now: float = None):
-        """Returns ``"press"`` when the button is newly pressed, else None."""
+        """Returns ``"press"`` or ``"pass"`` for a new action, else ``None``."""
         if state is None:
             return None
 
-        direction, pressed = state
+        if len(state) >= 3:
+            direction, pressed, pass_pressed = state[0], state[1], state[2]
+        else:
+            direction, pressed = state
+            pass_pressed = False
         if now is None:
             now = time.monotonic()
 
@@ -209,13 +226,36 @@ class _JoystickCursor:
             self._move(direction, game, led)
             self.next_repeat = now + self.REPEAT_INTERVAL
 
+        # Optional dedicated pass button.
+        if pass_pressed:
+            if not self.pass_down and now >= self.pass_ready:
+                self.pass_down = True
+                self.pass_ready = now + self.BUTTON_DEBOUNCE
+                return "pass"
+        else:
+            self.pass_down = False
+
         if pressed:
             if not self.button_down and now >= self.button_ready:
                 self.button_down = True
+                self.button_started = now
+                self.button_passed = False
                 self.button_ready = now + self.BUTTON_DEBOUNCE
-                return "press"
+            elif (
+                self.button_down
+                and not self.button_passed
+                and now - self.button_started >= self.PASS_HOLD
+            ):
+                # A long hold passes instead of playing a stone.
+                self.button_passed = True
+                return "pass"
         else:
-            self.button_down = False
+            if self.button_down:
+                self.button_down = False
+                if not self.button_passed:
+                    self.button_passed = False
+                    return "press"
+                self.button_passed = False
         return None
 
 
@@ -225,14 +265,16 @@ def _wait_for_command(
     game: Game,
     led: LEDRenderer,
     lines: queue.Queue,
+    joystick: _JoystickCursor = None,
 ) -> str:
-    """Waits for a typed command or a joystick press.
+    """Waits for a typed command, a joystick press, or a pass.
 
     Joystick movement is handled here so the cursor keeps moving while the
     program is waiting at the prompt.
     """
     print(prompt, end="", flush=True)
-    joystick = _JoystickCursor()
+    if joystick is None:
+        joystick = _JoystickCursor()
 
     while True:
         try:
@@ -240,9 +282,9 @@ def _wait_for_command(
         except OSError as error:
             print(f"\nJoystick error: {error}", file=sys.stderr)
             return "quit"
-        if action == "press":
+        if action in ("press", "pass"):
             print()
-            return "press"
+            return action
 
         try:
             line = lines.get(timeout=0.02)
@@ -281,8 +323,12 @@ def run_interactive(
         return 1
 
     command_lines = None
+    joystick_state = None
     if joystick and transport is not None:
         command_lines = _start_stdin_reader()
+        # Keep button state across prompts so a held pass button cannot
+        # trigger again on the next turn.
+        joystick_state = _JoystickCursor()
 
     try:
         while True:
@@ -290,7 +336,12 @@ def run_interactive(
                 prompt = f"\n{game.current_player.name.title()}> "
                 if command_lines is not None:
                     line = _wait_for_command(
-                        prompt, transport, game, led, command_lines
+                        prompt,
+                        transport,
+                        game,
+                        led,
+                        command_lines,
+                        joystick=joystick_state,
                     )
                 else:
                     line = input(prompt)

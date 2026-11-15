@@ -140,6 +140,138 @@ def matrix_layout(matrix_size: int, size: int) -> tuple:
     return tile, offset
 
 
+def panel_geometry(matrix_size: int, size: int) -> dict:
+    """Returns the board layout and the border coordinates around it.
+
+    The board occupies ``span`` pixels starting at ``offset``.  The border
+    sits one pixel outside that area.  When the board fills the panel the
+    border coordinates fall outside it; callers should use :func:`has_border`
+    before drawing.
+    """
+    tile, offset = matrix_layout(matrix_size, size)
+    span = tile * size
+    return {
+        "tile": tile,
+        "offset": offset,
+        "span": span,
+        "left": offset - 1,
+        "top": offset - 1,
+        "right": offset + span,
+        "bottom": offset + span,
+    }
+
+
+def has_border(matrix_size: int, size: int) -> bool:
+    """Reports whether a one-pixel border fits around the board."""
+    geometry = panel_geometry(matrix_size, size)
+    return (
+        geometry["left"] >= 0
+        and geometry["top"] >= 0
+        and geometry["right"] < matrix_size
+        and geometry["bottom"] < matrix_size
+    )
+
+
+def border_lines(matrix_size: int, size: int) -> list:
+    """Returns ``(x0, y0, x1, y1)`` lines for the border around the board."""
+    if not has_border(matrix_size, size):
+        return []
+    geometry = panel_geometry(matrix_size, size)
+    left = geometry["left"]
+    right = geometry["right"]
+    top = geometry["top"]
+    bottom = geometry["bottom"]
+    return [
+        (left, top, right, top),
+        (left, bottom, right, bottom),
+        (left, top, left, bottom),
+        (right, top, right, bottom),
+    ]
+
+
+def tick_pixels(matrix_size: int, size: int) -> set:
+    """Returns the border pixels that mark every board line boundary."""
+    if not has_border(matrix_size, size):
+        return set()
+    geometry = panel_geometry(matrix_size, size)
+    ticks = set()
+    top_row = geometry["top"] - 1
+    bottom_row = geometry["bottom"] + 1
+    left_col = geometry["left"] - 1
+    right_col = geometry["right"] + 1
+    for index in range(size + 1):
+        position = geometry["offset"] + index * geometry["tile"]
+        if not 0 <= position < matrix_size:
+            continue
+        for row in (top_row, bottom_row):
+            if 0 <= row < matrix_size:
+                ticks.add((position, row))
+        for column in (left_col, right_col):
+            if 0 <= column < matrix_size:
+                ticks.add((column, position))
+    return ticks
+
+
+def cursor_tick_pixels(matrix_size: int, size: int, cursor: tuple | None) -> set:
+    """Returns the tick pixels highlighted for the cursor's row and column."""
+    if cursor is None or not has_border(matrix_size, size):
+        return set()
+    geometry = panel_geometry(matrix_size, size)
+    x, y = cursor
+    if not (0 <= x < size and 0 <= y < size):
+        return set()
+
+    pixels = set()
+    tile = geometry["tile"]
+    x_start = geometry["offset"] + x * tile
+    y_start = geometry["offset"] + y * tile
+    for px in range(x_start, min(x_start + tile, matrix_size)):
+        for row in (geometry["top"] - 1, geometry["bottom"] + 1):
+            if 0 <= row < matrix_size:
+                pixels.add((px, row))
+    for py in range(y_start, min(y_start + tile, matrix_size)):
+        for column in (geometry["left"] - 1, geometry["right"] + 1):
+            if 0 <= column < matrix_size:
+                pixels.add((column, py))
+    return pixels
+
+
+def tracker_rectangles(
+    matrix_size: int, size: int, count: int, side: str
+) -> list:
+    """Returns ``(x, y, width, height)`` blocks for captured stones.
+
+    Blue captures run along the bottom edge and red captures down the right
+    edge.  Each stone is a 2x2 block, and the far corner is left free so the
+    two tracks cannot overwrite each other.
+    """
+    if side not in ("bottom", "right"):
+        raise ValueError("side must be 'bottom' or 'right'")
+    if count <= 0 or not has_border(matrix_size, size):
+        return []
+
+    geometry = panel_geometry(matrix_size, size)
+    # Leave the last two pixels of the edge for the other tracker.
+    slots = max(0, (matrix_size - 2) // 2)
+    count = min(count, slots)
+    rectangles = []
+    if side == "bottom":
+        y = geometry["bottom"] + 2
+        if y >= matrix_size:
+            return []
+        height = min(2, matrix_size - y)
+        for index in range(count):
+            rectangles.append((index * 2, y, 2, height))
+    else:
+        x = geometry["right"] + 2
+        if x >= matrix_size:
+            return []
+        width = min(2, matrix_size - x)
+        for index in range(count):
+            rectangles.append((x, index * 2, width, 2))
+    return rectangles
+
+
 class LEDRenderer:
     """Renders the board into a square LED-matrix frame.
 
@@ -155,6 +287,11 @@ class LEDRenderer:
     BLUE = 1
     RED = 2
     CURSOR = 3
+    BORDER = 4
+    TICK = 5
+    CURSOR_TICK = 6
+    BLUE_TRACKER = 7
+    RED_TRACKER = 8
 
     def __init__(self, matrix_size: int = 32, write=None, transport=None):
         if matrix_size < 1:
@@ -163,7 +300,12 @@ class LEDRenderer:
         self.write = write
         self.transport = transport
 
-    def frame(self, board: Board, cursor: tuple | None = None) -> list:
+    def frame(
+        self,
+        board: Board,
+        cursor: tuple | None = None,
+        captured: dict | None = None,
+    ) -> list:
         size = board.size
         if self.matrix_size < size:
             raise ValueError("matrix must be at least as large as the board")
@@ -172,6 +314,32 @@ class LEDRenderer:
             [self.EMPTY for _ in range(self.matrix_size)]
             for _ in range(self.matrix_size)
         ]
+
+        for x0, y0, x1, y1 in border_lines(self.matrix_size, size):
+            if y0 == y1:
+                for px in range(min(x0, x1), max(x0, x1) + 1):
+                    frame[y0][px] = self.BORDER
+            else:
+                for py in range(min(y0, y1), max(y0, y1) + 1):
+                    frame[py][x0] = self.BORDER
+
+        captured = captured or {}
+        # Blue captures red stones, so the bottom track is red; red captures
+        # blue stones, so the right track is blue.
+        trackers = (
+            ("bottom", Piece.BLUE, self.RED_TRACKER),
+            ("right", Piece.RED, self.BLUE_TRACKER),
+        )
+        for side, capturer, value in trackers:
+            for x, y, width, height in tracker_rectangles(
+                self.matrix_size, size, captured.get(capturer, 0), side
+            ):
+                for dy in range(height):
+                    for dx in range(width):
+                        frame[y + dy][x + dx] = value
+
+        for px, py in tick_pixels(self.matrix_size, size):
+            frame[py][px] = self.TICK
 
         for y in range(size):
             for x in range(size):
@@ -187,15 +355,23 @@ class LEDRenderer:
                 for dy in range(tile):
                     for dx in range(tile):
                         frame[offset + y * tile + dy][offset + x * tile + dx] = value
+
+        for px, py in cursor_tick_pixels(self.matrix_size, size, cursor):
+            frame[py][px] = self.CURSOR_TICK
         return frame
 
     def encode(self, frame: list) -> str:
         return "\n".join(",".join(str(value) for value in row) for row in frame)
 
-    def render(self, board: Board, cursor: tuple | None = None) -> list:
-        frame = self.frame(board, cursor)
+    def render(
+        self,
+        board: Board,
+        cursor: tuple | None = None,
+        captured: dict | None = None,
+    ) -> list:
+        frame = self.frame(board, cursor, captured)
         if self.transport is not None:
-            self.transport.send(board, cursor)
+            self.transport.send(board, cursor, captured)
         elif self.write is not None:
             self.write(self.encode(frame))
         return frame
@@ -216,11 +392,18 @@ class SerialLEDTransport:
     * ``C`` — clear the panel
     * ``S x y size r g b 1`` — draw a filled square
     * ``P x y r g b`` — draw one pixel
+    * ``L x0 y0 x1 y1 r g b`` — draw a line
     * ``J`` — read the joystick state (``J <U|D|L|R|0> <0|1>``)
 
     The cursor blinks by toggling just its own pixels, so the rest of the
     board is not redrawn.  It can also be moved without redrawing the whole
     board, which keeps joystick movement responsive.
+
+    A one-pixel border with ticks surrounds the board.  The tick beside the
+    cursor's row and column is brightened, so the border acts as a coordinate
+    indicator.  Captured stones are tracked along the edges in the colour of
+    the captured stone: blue's captures (red stones) run along the bottom and
+    red's captures (blue stones) down the right side.
 
     Each intersection is drawn as a centred tile.  Blue stones use blue,
     red stones use red, and the cursor uses grey on an empty point or a white
@@ -239,6 +422,13 @@ class SerialLEDTransport:
     RED_RGB = (7, 0, 0)
     CURSOR_RGB = (4, 4, 4)
     WHITE_RGB = (7, 7, 7)
+    BORDER_RGB = (1, 1, 1)
+    TICK_RGB = (3, 3, 3)
+    CURSOR_TICK_RGB = (7, 7, 7)
+    TRACKER_RGB = {
+        Piece.BLUE: (0, 0, 7),
+        Piece.RED: (7, 0, 0),
+    }
 
     def __init__(
         self,
@@ -301,7 +491,27 @@ class SerialLEDTransport:
                 return True
         return False
 
-    def encode(self, board: Board, cursor: tuple | None = None) -> bytes:
+    def _rect_commands(self, rectangle: tuple, colour: tuple) -> list:
+        x, y, width, height = rectangle
+        red, green, blue = colour
+        if width == 2 and height == 2:
+            return [f"S {x} {y} 2 {red} {green} {blue} 1"]
+        if height == 1:
+            return [f"L {x} {y} {x + width - 1} {y} {red} {green} {blue}"]
+        if width == 1:
+            return [f"L {x} {y} {x} {y + height - 1} {red} {green} {blue}"]
+        return [
+            f"P {x + dx} {y + dy} {red} {green} {blue}"
+            for dy in range(height)
+            for dx in range(width)
+        ]
+
+    def encode(
+        self,
+        board: Board,
+        cursor: tuple | None = None,
+        captured: dict | None = None,
+    ) -> bytes:
         size = board.size
         if not 1 <= size <= self.MAX_SIZE:
             raise ValueError(f"board size {size} is not supported by the LED firmware")
@@ -311,6 +521,29 @@ class SerialLEDTransport:
         tile, offset = self._layout(size)
 
         commands = [f"B {self.brightness}", "C"]
+        red, green, blue = self.BORDER_RGB
+        for x0, y0, x1, y1 in border_lines(self.matrix_size, size):
+            commands.append(f"L {x0} {y0} {x1} {y1} {red} {green} {blue}")
+
+        captured = captured or {}
+        # The track shows the colour of the captured stone, not the colour of
+        # the side that captured it.  Blue captures red stones along the
+        # bottom; red captures blue stones down the right.
+        trackers = (
+            ("bottom", Piece.BLUE),
+            ("right", Piece.RED),
+        )
+        for side, capturer in trackers:
+            colour = self.TRACKER_RGB[capturer.opponent]
+            for rectangle in tracker_rectangles(
+                self.matrix_size, size, captured.get(capturer, 0), side
+            ):
+                commands.extend(self._rect_commands(rectangle, colour))
+
+        red, green, blue = self.TICK_RGB
+        for px, py in sorted(tick_pixels(self.matrix_size, size)):
+            commands.append(f"P {px} {py} {red} {green} {blue}")
+
         for y in range(size):
             for x in range(size):
                 piece = board.stone_at(x, y)
@@ -333,6 +566,10 @@ class SerialLEDTransport:
                 if is_cursor and piece in (Piece.BLUE, Piece.RED):
                     # Keep the stone colour while showing where the cursor is.
                     commands.append(f"P {px} {py} 7 7 7")
+
+        red, green, blue = self.CURSOR_TICK_RGB
+        for px, py in sorted(cursor_tick_pixels(self.matrix_size, size, cursor)):
+            commands.append(f"P {px} {py} {red} {green} {blue}")
         return ("\n".join(commands) + "\n").encode("ascii")
 
     def _wait_for_ack(self, command: bytes, timeout: float) -> None:
@@ -357,12 +594,13 @@ class SerialLEDTransport:
         self._wait_for_ack(command, self.ack_timeout)
 
     def poll_joystick(self, timeout: float = 0.3) -> tuple | None:
-        """Returns ``(direction, pressed)`` or ``None``.
+        """Returns ``(direction, pressed, pass_pressed)`` or ``None``.
 
         ``direction`` is one of ``U``, ``D``, ``L``, ``R`` or ``0``.  The
-        firmware replies to a ``J`` command with ``J <direction> <0|1>``.
-        The serial transaction is locked so it cannot interleave with the
-        cursor-blink thread.
+        firmware replies to a ``J`` command with
+        ``J <direction> <0|1> <0|1>``.  Older firmware that omits the final
+        pass field is still accepted.  The serial transaction is locked so it
+        cannot interleave with the cursor-blink thread.
         """
         with self._lock:
             previous_timeout = getattr(self.serial, "timeout", None)
@@ -386,7 +624,8 @@ class SerialLEDTransport:
                     direction = parts[1].upper()
                     if direction not in ("U", "D", "L", "R"):
                         direction = "0"
-                    return direction, parts[2] != "0"
+                    pass_pressed = len(parts) >= 4 and parts[3] != "0"
+                    return direction, parts[2] != "0", pass_pressed
                 return None
             finally:
                 if previous_timeout is not None:
@@ -434,6 +673,24 @@ class SerialLEDTransport:
 
         self._write_acked(command.encode("ascii"))
 
+    def _write_cursor_ticks(
+        self, size: int, cursor: tuple | None, restore: bool = False
+    ) -> None:
+        """Draws or restores the row/column highlight on the tick border."""
+        pixels = cursor_tick_pixels(self.matrix_size, size, cursor)
+        if not pixels:
+            return
+        ticks = tick_pixels(self.matrix_size, size) if restore else set()
+        for px, py in sorted(pixels):
+            if restore:
+                colour = (
+                    self.TICK_RGB if (px, py) in ticks else (0, 0, 0)
+                )
+            else:
+                colour = self.CURSOR_TICK_RGB
+            red, green, blue = colour
+            self._write_acked(f"P {px} {py} {red} {green} {blue}".encode("ascii"))
+
     def _draw_point(self, board: Board, point: tuple, size: int = None) -> None:
         """Redraws one intersection, including clearing an empty point."""
         if size is None:
@@ -466,10 +723,12 @@ class SerialLEDTransport:
             if old == self._cursor:
                 return
             if old is not None:
+                self._write_cursor_ticks(old_size, old, restore=True)
                 self._draw_point(board, old, old_size)
             if self._cursor is not None:
                 self._blink_visible = True
                 self._write_cursor()
+                self._write_cursor_ticks(board.size, self._cursor)
 
     def _blink_loop(self) -> None:
         while not self._blink_stop.wait(self._blink_interval):
@@ -483,11 +742,16 @@ class SerialLEDTransport:
                     # The port was unplugged or closed; stop blinking quietly.
                     return
 
-    def send(self, board: Board, cursor: tuple | None = None) -> None:
+    def send(
+        self,
+        board: Board,
+        cursor: tuple | None = None,
+        captured: dict | None = None,
+    ) -> None:
         # The Uno has a 64-byte serial input buffer.  Send one command at a
         # time and wait for the firmware's "OK", otherwise a full 13x13 board
         # can overrun the buffer and leave a partial frame on the panel.
-        payload = self.encode(board, cursor)
+        payload = self.encode(board, cursor, captured)
         with self._lock:
             for line in payload.splitlines():
                 self._write_acked(line)

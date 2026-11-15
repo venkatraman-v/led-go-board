@@ -227,11 +227,16 @@ class SerialLEDTransportTests(unittest.TestCase):
         lines = self._transport().encode(board, cursor=(1, 1)).decode("ascii").splitlines()
 
         # A 3x3 board uses 10x10 tiles, centred with a one-pixel offset.
+        # There is no room for ticks or trackers, but the border is drawn.
         self.assertEqual(
             lines,
             [
                 "B 1",
                 "C",
+                "L 0 0 31 0 1 1 1",
+                "L 0 31 31 31 1 1 1",
+                "L 0 0 0 31 1 1 1",
+                "L 31 0 31 31 1 1 1",
                 "S 1 1 10 0 0 7 1",
                 "S 11 11 10 4 4 4 1",
                 "S 21 11 10 7 0 0 1",
@@ -251,9 +256,83 @@ class SerialLEDTransportTests(unittest.TestCase):
         self.assertIn("S 2 2 2 0 0 7 1", lines)
         self.assertIn("S 26 26 2 7 0 0 1", lines)
 
+    def test_encode_draws_border_ticks_and_cursor_highlight(self):
+        lines = (
+            self._transport()
+            .encode(Board(13), cursor=(1, 1))
+            .decode("ascii")
+            .splitlines()
+        )
+
+        # Border is a 28x28 box one pixel outside the 13x13 board.
+        self.assertIn("L 1 1 28 1 1 1 1", lines)
+        self.assertIn("L 1 28 28 28 1 1 1", lines)
+        self.assertIn("L 1 1 1 28 1 1 1", lines)
+        self.assertIn("L 28 1 28 28 1 1 1", lines)
+
+        # Every board line boundary gets a tick on all four sides.
+        self.assertIn("P 2 0 3 3 3", lines)
+        self.assertIn("P 2 29 3 3 3", lines)
+        self.assertIn("P 0 2 3 3 3", lines)
+        self.assertIn("P 29 2 3 3 3", lines)
+
+        # The cursor at (1,1) highlights the two ticks beside its tile.
+        for pixel in (
+            "P 4 0 7 7 7",
+            "P 5 0 7 7 7",
+            "P 4 29 7 7 7",
+            "P 5 29 7 7 7",
+            "P 0 4 7 7 7",
+            "P 0 5 7 7 7",
+            "P 29 4 7 7 7",
+            "P 29 5 7 7 7",
+        ):
+            self.assertIn(pixel, lines)
+
+    def test_encode_draws_captured_stone_trackers(self):
+        lines = (
+            self._transport()
+            .encode(
+                Board(13),
+                captured={Piece.BLUE: 2, Piece.RED: 1},
+            )
+            .decode("ascii")
+            .splitlines()
+        )
+
+        # Blue captured red stones, so the bottom blocks are red.  Red
+        # captured blue stones, so the right blocks are blue.
+        self.assertIn("S 0 30 2 7 0 0 1", lines)
+        self.assertIn("S 2 30 2 7 0 0 1", lines)
+        self.assertIn("S 30 0 2 0 0 7 1", lines)
+        # The bottom-right corner is reserved so the tracks cannot collide.
+        self.assertNotIn("S 30 30 2 7 0 0 1", lines)
+        self.assertNotIn("S 30 30 2 0 0 7 1", lines)
+
+    def test_captured_stone_tracker_clamps_to_available_slots(self):
+        lines = (
+            self._transport()
+            .encode(Board(13), captured={Piece.BLUE: 99, Piece.RED: 0})
+            .decode("ascii")
+            .splitlines()
+        )
+
+        self.assertIn("S 28 30 2 7 0 0 1", lines)
+        self.assertNotIn("S 30 30 2 7 0 0 1", lines)
+
     def test_encode_skips_empty_points(self):
         lines = self._transport().encode(Board(5)).decode("ascii").splitlines()
-        self.assertEqual(lines, ["B 1", "C"])
+        self.assertEqual(
+            lines,
+            [
+                "B 1",
+                "C",
+                "L 0 0 31 0 1 1 1",
+                "L 0 31 31 31 1 1 1",
+                "L 0 0 0 31 1 1 1",
+                "L 31 0 31 31 1 1 1",
+            ],
+        )
 
     def test_cursor_over_stone_keeps_stone_colour(self):
         board = Board(3)
@@ -331,14 +410,15 @@ class SerialLEDTransportTests(unittest.TestCase):
             def __init__(self):
                 self.sent = []
 
-            def send(self, board, cursor=None):
-                self.sent.append((board.size, cursor))
+            def send(self, board, cursor=None, captured=None):
+                self.sent.append((board.size, cursor, captured))
 
         transport = RecordingTransport()
         renderer = LEDRenderer(transport=transport)
         board = Board(13)
-        frame = renderer.render(board, cursor=(4, 5))
-        self.assertEqual(transport.sent, [(13, (4, 5))])
+        captured = {Piece.BLUE: 2, Piece.RED: 1}
+        frame = renderer.render(board, cursor=(4, 5), captured=captured)
+        self.assertEqual(transport.sent, [(13, (4, 5), captured)])
         self.assertEqual(len(frame), 32)
 
     def test_send_writes_and_flushes_frame(self):
@@ -398,7 +478,7 @@ class SerialLEDTransportTests(unittest.TestCase):
         transport = self._transport()
         transport.serial = FakeSerial()
 
-        self.assertEqual(transport.poll_joystick(), ("R", True))
+        self.assertEqual(transport.poll_joystick(), ("R", True, False))
         self.assertEqual(transport.serial.written, b"J\n")
 
     def test_poll_joystick_ignores_unrelated_replies(self):
@@ -418,7 +498,39 @@ class SerialLEDTransportTests(unittest.TestCase):
         transport = self._transport()
         transport.serial = FakeSerial()
 
-        self.assertEqual(transport.poll_joystick(), ("0", False))
+        self.assertEqual(transport.poll_joystick(), ("0", False, False))
+
+    def test_poll_joystick_parses_the_pass_button(self):
+        class FakeSerial:
+            def write(self, data):
+                pass
+
+            def flush(self):
+                pass
+
+            def readline(self):
+                return b"J 0 0 1\r\n"
+
+        transport = self._transport()
+        transport.serial = FakeSerial()
+
+        self.assertEqual(transport.poll_joystick(), ("0", False, True))
+
+    def test_poll_joystick_accepts_old_firmware_without_the_pass_field(self):
+        class FakeSerial:
+            def write(self, data):
+                pass
+
+            def flush(self):
+                pass
+
+            def readline(self):
+                return b"J U 1\r\n"
+
+        transport = self._transport()
+        transport.serial = FakeSerial()
+
+        self.assertEqual(transport.poll_joystick(), ("U", True, False))
 
     def test_move_cursor_redraws_only_the_old_and_new_points(self):
         class FakeSerial:
@@ -449,6 +561,40 @@ class SerialLEDTransportTests(unittest.TestCase):
             b"S 7 7 6 0 0 0 1\nS 13 7 6 4 4 4 1\n",
         )
 
+    def test_move_cursor_moves_the_tick_highlight(self):
+        class FakeSerial:
+            def __init__(self):
+                self.written = b""
+
+            def write(self, data):
+                self.written += data
+
+            def flush(self):
+                pass
+
+            def readline(self):
+                return b"OK\r\n"
+
+        transport = self._transport()
+        transport.serial = FakeSerial()
+        board = Board(13)
+
+        transport.move_cursor(board, (1, 1))
+        transport.serial.written = b""
+        transport.move_cursor(board, (2, 1))
+        written = transport.serial.written
+
+        # The old highlight is restored to a tick or to the background.
+        self.assertIn(b"P 4 0 3 3 3\n", written)
+        self.assertIn(b"P 5 0 0 0 0\n", written)
+        self.assertIn(b"P 0 4 3 3 3\n", written)
+        self.assertIn(b"P 0 5 0 0 0\n", written)
+        # The cursor tile itself is redrawn and the new ticks light up.
+        self.assertIn(b"S 4 4 2 0 0 0 1\n", written)
+        self.assertIn(b"S 6 4 2 4 4 4 1\n", written)
+        self.assertIn(b"P 6 0 7 7 7\n", written)
+        self.assertIn(b"P 7 29 7 7 7\n", written)
+
 
 class MatrixLayoutTests(unittest.TestCase):
     def test_13x13_tiles_do_not_cross_the_half_panel_seam(self):
@@ -475,9 +621,10 @@ class MatrixLayoutTests(unittest.TestCase):
         frame = LEDRenderer().frame(board)
 
         # Offset 2 puts the top-left 2x2 tile on rows 2-3, not rows 3-4.
+        # The border occupies row/column 1, so check the free corner instead.
         self.assertEqual(frame[2][2], LEDRenderer.BLUE)
         self.assertEqual(frame[3][3], LEDRenderer.BLUE)
-        self.assertEqual(frame[1][1], LEDRenderer.EMPTY)
+        self.assertEqual(frame[0][0], LEDRenderer.EMPTY)
 
 
 class TurnOrderTests(unittest.TestCase):
@@ -488,7 +635,7 @@ class TurnOrderTests(unittest.TestCase):
             def __init__(self):
                 self.frames = []
 
-            def render(self, board, cursor=None):
+            def render(self, board, cursor=None, captured=None):
                 self.frames.append(
                     (board.stone_at(1, 1), board.stone_at(0, 0))
                 )

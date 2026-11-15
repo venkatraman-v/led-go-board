@@ -40,15 +40,20 @@ shown as `+` on an empty point, or as a lowercase `b`/`r` over a stone.
 
 ## Joystick
 
-With `--led-serial`, the firmware reports the analog stick and button over the
-same serial connection.  The stick axes are read on **A4 (X)** and **A5 (Y)**.
-The button may be wired to **A4**, **D11**, **D12**, or **D13**; on this board
-the button shares A4 with the X axis and pulls it to the top rail when pressed.
+With `--led-serial`, the firmware reports the analog stick and buttons over
+the same serial connection.  The stick axes are read on **A4 (X)** and
+**A5 (Y)**.  The play button shares A4 with the X axis and pulls it to the top
+rail when pressed.  A second, optional pass button can be wired to **D11**,
+**D12**, or **D13**.
 
 - Tilting the stick moves the cursor one intersection immediately.
 - Holding a direction repeats after 0.35 s at about seven steps per second.
-- Pressing the button plays at the cursor and, against KataGo, immediately
-  starts the engine reply.
+- A short press plays at the cursor and, against KataGo, immediately starts
+  the engine reply.
+- **Hold the button for 0.9 s to pass.**  This works with the existing
+  joystick, so no extra wiring is required.
+- Optionally wire a dedicated pass button between any of **D11–D13** and
+  ground.  It passes immediately and is independent of the stick button.
 - Use `--no-joystick` to disable hardware input.
 
 Only the cursor changes are sent while the stick moves, so movement stays
@@ -108,6 +113,15 @@ or `uucp` (Arch) group to open the port.  Brightness is `1` (dimmest,
 battery-safe) through `7` (brightest).  The cursor blinks at about 2 Hz; use
 `--no-led-blink` to keep it steady.
 
+The board is surrounded by a one-pixel border with a tick at every line
+boundary.  The ticks beside the cursor's row and column are brightened, so the
+border doubles as a position indicator without needing full coordinate labels.
+Captured stones are also shown along the edges in the colour of the stone
+that was captured: **Blue's captures (red stones) along the bottom** and
+**Red's captures (blue stones) down the right side**, one 2×2 block per
+captured stone.  The shared bottom-right corner is left free so the two
+tracks cannot overwrite each other.
+
 ### Serial protocol
 
 The firmware listens for newline-terminated text commands and replies `OK`:
@@ -121,24 +135,27 @@ The firmware listens for newline-terminated text commands and replies `OK`:
 | `S x y size r g b [fill]` | Draw a square, filled by default |
 | `T x0 y0 x1 y1 x2 y2 r g b [fill]` | Draw a triangle |
 | `B n` | Set brightness (`1`–`7`) |
-| `J` | Return joystick state: `J <U\|D\|L\|R\|0> <0\|1>` |
-| `K` | Return raw joystick diagnostics: `K <x> <y> <button bits>` |
+| `J` | Return joystick state: `J <U\|D\|L\|R\|0> <play> <pass>` |
+| `K` | Return raw joystick diagnostics: `K <x> <y> <pass button bits>` |
 | `?` | Return `READY` |
 
-For each board update the Python transport sends `B`, then `C`, then one
-filled `S` command per stone or cursor.  Each intersection is a centred tile,
-so a 13×13 board becomes 2×2 blocks on the 32×32 panel.  The layout is shifted
-by one pixel when needed so no tile straddles the seam between the panel's two
-16-row halves.  The cursor is a grey tile on an empty point, or a white pixel
-on top of a stone.  Upload the firmware with PlatformIO:
+For each board update the Python transport sends `B`, then `C`, then the
+border `L` commands, the tracker blocks, the tick pixels, and one filled `S`
+command per stone or cursor.  Each intersection is a centred tile, so a 13×13
+board becomes 2×2 blocks on the 32×32 panel.  The layout is shifted by one
+pixel when needed so no tile straddles the seam between the panel's two 16-row
+halves.  The cursor is a grey tile on an empty point, or a white pixel on top
+of a stone.  Moving the cursor redraws only the old/new cursor pixels and the
+affected ticks, so joystick movement stays fast.  Upload the firmware with
+PlatformIO:
 
 ```bash
 cd firmware
 pio run --target upload
 ```
 
-Frames also work over any transport with a `send(board, cursor)` method; the
-renderer accepts one via `LEDRenderer(transport=...)`.
+Frames also work over any transport with a `send(board, cursor, captured)`
+method; the renderer accepts one via `LEDRenderer(transport=...)`.
 
 ## Rules implemented
 

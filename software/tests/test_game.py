@@ -201,7 +201,37 @@ class InputOutputTests(unittest.TestCase):
         self.assertEqual(len(frame), 32)
         self.assertEqual(len(frame[0]), 32)
         values = {value for row in frame for value in row}
-        self.assertEqual(values, {LEDRenderer.EMPTY, LEDRenderer.BLUE, LEDRenderer.RED, LEDRenderer.CURSOR})
+        self.assertEqual(
+            values,
+            {
+                LEDRenderer.EMPTY,
+                LEDRenderer.BLUE,
+                LEDRenderer.RED,
+                LEDRenderer.CURSOR,
+                LEDRenderer.BORDER,
+                LEDRenderer.TICK,
+                LEDRenderer.CURSOR_TICK,
+            },
+        )
+
+    def test_led_frame_shows_captured_trackers(self):
+        board = Board(13)
+        renderer = LEDRenderer(matrix_size=32)
+        frame = renderer.frame(
+            board,
+            captured={Piece.BLUE: 2, Piece.RED: 1},
+        )
+
+        # Blue captured red stones along the bottom; red captured blue stones
+        # down the right.  The track shows the captured stone's colour.
+        self.assertEqual(frame[30][0], LEDRenderer.RED_TRACKER)
+        self.assertEqual(frame[31][1], LEDRenderer.RED_TRACKER)
+        self.assertEqual(frame[30][2], LEDRenderer.RED_TRACKER)
+        self.assertEqual(frame[31][3], LEDRenderer.RED_TRACKER)
+        self.assertEqual(frame[0][30], LEDRenderer.BLUE_TRACKER)
+        self.assertEqual(frame[1][31], LEDRenderer.BLUE_TRACKER)
+        # The shared bottom-right corner stays free.
+        self.assertEqual(frame[31][31], LEDRenderer.EMPTY)
 
     def test_coordinate_parsing(self):
         self.assertEqual(parse_coordinate("A1"), (0, 0))
@@ -241,15 +271,55 @@ class JoystickCursorTests(unittest.TestCase):
         game = Game(size=5)
         joystick = _JoystickCursor()
 
-        self.assertEqual(joystick.update(("0", True), game, None, now=0.0), "press")
-        self.assertIsNone(joystick.update(("0", True), game, None, now=0.1))
-        self.assertIsNone(joystick.update(("0", False), game, None, now=0.2))
-        self.assertEqual(joystick.update(("0", True), game, None, now=0.3), "press")
+        # A short press plays on release.
+        self.assertIsNone(joystick.update(("0", True, False), game, None, now=0.0))
+        self.assertIsNone(joystick.update(("0", True, False), game, None, now=0.1))
+        self.assertEqual(
+            joystick.update(("0", False, False), game, None, now=0.2), "press"
+        )
+        self.assertIsNone(joystick.update(("0", False, False), game, None, now=0.3))
+        self.assertIsNone(joystick.update(("0", True, False), game, None, now=0.4))
+        self.assertEqual(
+            joystick.update(("0", False, False), game, None, now=0.5), "press"
+        )
+
+    def test_holding_the_button_passes_instead_of_playing(self):
+        game = Game(size=5)
+        joystick = _JoystickCursor()
+
+        self.assertIsNone(joystick.update(("0", True, False), game, None, now=0.0))
+        self.assertIsNone(joystick.update(("0", True, False), game, None, now=0.5))
+        self.assertEqual(
+            joystick.update(("0", True, False), game, None, now=0.95), "pass"
+        )
+        # Releasing after the pass must not also play a stone.
+        self.assertIsNone(joystick.update(("0", False, False), game, None, now=1.0))
+
+    def test_dedicated_pass_button_passes_once(self):
+        game = Game(size=5)
+        joystick = _JoystickCursor()
+
+        self.assertEqual(
+            joystick.update(("0", False, True), game, None, now=0.0), "pass"
+        )
+        self.assertIsNone(joystick.update(("0", False, True), game, None, now=0.1))
+        self.assertIsNone(joystick.update(("0", False, False), game, None, now=0.2))
+        self.assertEqual(
+            joystick.update(("0", False, True), game, None, now=0.4), "pass"
+        )
 
     def test_joystick_press_becomes_the_press_command(self):
         class FakeTransport:
+            def __init__(self):
+                self.calls = 0
+
             def poll_joystick(self):
-                return ("0", True)
+                self.calls += 1
+                if self.calls == 1:
+                    return ("0", True, False)
+                if self.calls == 2:
+                    return ("0", False, False)
+                return None
 
         game = Game(size=5)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -258,6 +328,19 @@ class JoystickCursorTests(unittest.TestCase):
             )
 
         self.assertEqual(result, "press")
+
+    def test_dedicated_pass_button_becomes_the_pass_command(self):
+        class FakeTransport:
+            def poll_joystick(self):
+                return ("0", False, True)
+
+        game = Game(size=5)
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = _wait_for_command(
+                "> ", FakeTransport(), game, None, queue.Queue()
+            )
+
+        self.assertEqual(result, "pass")
 
     def test_joystick_moves_before_a_typed_command_is_returned(self):
         class FakeTransport:
